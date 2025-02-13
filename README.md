@@ -9,16 +9,19 @@
 [![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](https://gist.github.com/rdnajac/e68c6c723360a4adadcfabe106e91a1d)
 [![Markdown](https://img.shields.io/badge/markdown-%23000000.svg?style=for-the-badge&logo=markdown&logoColor=white)](https://github.com/rdnajac/cbmf/wiki)
 
-```
+```c
 main()
 {
     printf("hello, world\n");
 }
 ```
 
+## 🔭 I’m currently working on
+
+Adding submodules to this repository.
+
 <!--- Here are some ideas to get you started:
 
-- 🔭 I’m currently working on ...
 - 🌱 I’m currently learning ...
 - 👯 I’m looking to collaborate on ...
 - 🤔 I’m looking for help with ...

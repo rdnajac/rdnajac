@@ -1,3 +1,9 @@
-[submodule "after"]
-	path = after
-	url = git@github.com:rdnajac/after.git
+[submodule "src/vim"]
+	path = src/vim
+	url = https://github.com/vim/vim
+[submodule "src/neovim"]
+	path = src/neovim
+	url = https://github.com/neovim/neovim
+[submodule "src/nnn"]
+	path = src/nnn
+	url = https://github.com/jarun/nnn.git

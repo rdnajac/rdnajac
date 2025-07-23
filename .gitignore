@@ -1,6 +1,4 @@
 # ignore everything...
 /*
-
 # except these directories
 !/src/
-!/scripts/

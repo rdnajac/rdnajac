@@ -1,4 +1,6 @@
+<!-- https://github.com/Ileriayo/markdown-badges -->
 [![Vim](https://img.shields.io/badge/VIM-%2311AB00.svg?style=for-the-badge&logo=vim&logoColor=white)](https://github.com/rdnajac/.vim)
+[![Neovim](https://img.shields.io/badge/NeoVim-%2357A143.svg?&style=for-the-badge&logo=neovim&logoColor=white)](https://github.com/rdnajac/nvim)
 [![C](https://img.shields.io/badge/c-%2300599C.svg?style=for-the-badge&logo=c&logoColor=white)](https://gist.github.com/rdnajac/cc327902deb54098dd474076c60e16cc)
 [![C++](https://img.shields.io/badge/c++-%2300599C.svg?style=for-the-badge&logo=c%2B%2B&logoColor=white)](https://github.com/rdnajac/DecodeNcodeAnything)
 [![LaTeX](https://img.shields.io/badge/latex-%23008080.svg?style=for-the-badge&logo=latex&logoColor=white)](https://github.com/rdnajac/SOCKit/blob/main/docs/LRM/LRM.pdf)
@@ -17,7 +19,7 @@ main()
 
 ## 🔭 I’m currently working on
 
-Adding submodules to this repository.
+Using thie repository to manage my GitHub profile and repositories.
 
 <!--- Here are some ideas to get you started:
 

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eux
+INSTALL_DIR="$HOME/.local/neovim"
+cd neovim || exit 1
+# clear the CMake cache and runtime files
+rm -rf "$INSTALL_DIR" ./build/
+make CMAKE_EXTRA_FLAGS="-DCMAKE_INSTALL_PREFIX=$INSTALL_DIR"
+make -j"$(nproc)" install

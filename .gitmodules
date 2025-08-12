@@ -4,9 +4,6 @@
 [submodule "src/neovim"]
 	path = src/neovim
 	url = https://github.com/neovim/neovim
-[submodule "src/nnn"]
-	path = src/nnn
-	url = https://github.com/jarun/nnn.git
 [submodule "src/fzf"]
 	path = src/fzf
 	url = https://github.com/junegunn/fzf

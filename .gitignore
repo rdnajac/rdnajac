@@ -1,6 +1,2 @@
 # ignore everything...
-/*
-# except these directories
-!/src/fzf
-!/src/neovim
-!/src/vim
+*

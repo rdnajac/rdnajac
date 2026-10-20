@@ -1,54 +1,48 @@
 #!/usr/bin/env -S nvim -l
 
--- List and sync GitHub starred repos with nvim
--- TODO: set this up as a dir provider for browsing
+-- Keep GitHub stars and star lists in sync with stars.json, and render them
+-- into README.md between the `<!-- stars:start -->` and `<!-- stars:end -->`
+-- markers.
 --
 -- Usage:
---   ./stars.lua pull          fetch current GitHub state into stars.json + README.md
---   ./stars.lua sync          dry run: show what would change on GitHub
---   ./stars.lua sync --apply  push those changes for real
+--    ./stars.lua -h
 
 assert(vim.fn.executable('gh') == 1)
 
-local nv = require('nvim')
-
 local root = vim.fs.dirname(vim.fs.abspath(_G.arg[0]))
-local json_path = nv.cache_path('stars.json')
-local state_name = 'stars-state.json'
-local readme_path = vim.fs.joinpath(root, 'README.md')
+local stars_file = vim.fs.joinpath(root, 'stars.json')
+local readme_file = vim.fs.joinpath(root, 'README.md')
+local backup_file = vim.fs.joinpath(vim.fn.stdpath('cache'), 'stars-backup.json')
+
 local stars_start = '<!-- stars:start -->'
 local stars_end = '<!-- stars:end -->'
 local uncategorized = 'Uncategorized'
 
-local color = {
-  reset = '\27[0m',
-  dim = '\27[2m',
-  red = '\27[31m',
-  green = '\27[32m',
-  yellow = '\27[33m',
-  cyan = '\27[36m',
-}
-
-local is_tty = vim.uv.guess_handle(1) == 'tty'
-
---- @param text string
---- @param c string
---- @return string
-local function paint(text, c)
-  return is_tty and (c .. text .. color.reset) or text
-end
-
---- @param msg string
 local function die(msg)
-  print(paint(msg, color.red))
+  print(msg)
   vim.cmd('cquit 1')
 end
 
---- @param path string
+--- Run a command, die on failure with err_msg
+--- @param cmd string[]
+--- @param err_msg string
 --- @return string
+local function run_die(cmd, err_msg)
+  local rv = vim.system(cmd, { text = true }):wait()
+  if rv.code ~= 0 then
+    die(('%s\n%s'):format(err_msg, vim.trim(rv.stderr or '')))
+  end
+  return rv.stdout
+end
+
+--- @param path string
+--- @return string?
 local function read_file(path)
-  local f = assert(io.open(path, 'r'))
-  local s = f:read('a')
+  local f = io.open(path, 'r')
+  if not f then
+    return nil
+  end
+  local s = f:read('*a')
   f:close()
   return s
 end
@@ -61,408 +55,415 @@ local function write_file(path, s)
   f:close()
 end
 
---- @param t table<string, any>
---- @return string[]
-local function sorted_keys(t)
-  local keys = vim.tbl_keys(t)
-  table.sort(keys)
-  return keys
-end
-
---- @param query string
---- @param variables table<string, string>?
---- @return table
-local function gh_graphql(query, variables)
-  -- `-f` sends every variable as a string. `-F` would type-guess and send a
-  -- name like "2024" as an Int, which fails against a String! variable.
-  local cmd = { 'gh', 'api', 'graphql', '-f', 'query=' .. query }
-  for k, v in pairs(variables or {}) do
-    cmd[#cmd + 1] = '-f'
-    cmd[#cmd + 1] = string.format('%s=%s', k, v)
-  end
-  local rv = vim.system(cmd):wait()
-  if rv.code ~= 0 then
-    local err = vim.trim(rv.stderr)
-    if err:find('required scopes') then
-      err = err .. '\nrun `gh auth refresh -h github.com -s user` to grant the missing scope'
-    end
-    die('gh graphql failed: ' .. err)
-  end
-  -- luanil drops JSON null fields, for example an empty repo description.
-  return vim.json.decode(rv.stdout, { luanil = { object = true } }).data
-end
-
---- @param method string
 --- @param path string
-local function gh_rest(method, path)
-  local rv = vim.system({ 'gh', 'api', '-X', method, path }):wait()
-  if rv.code ~= 0 then
-    die(string.format('gh api %s %s failed: %s', method, path, vim.trim(rv.stderr)))
+--- @param obj any
+local function write_json(path, obj)
+  write_file(path, vim.json.encode(obj, { indent = '  ', sort_keys = true }) .. '\n')
+end
+
+--- Every variable is sent with `-f` (as a string). `-F` would type-guess, so
+--- a repo named "2024" would go out as an Int and fail against `String!`.
+--- @param query string
+--- @param vars table<string, string>?
+--- @return table
+local function graphql(query, vars)
+  local cmd = { 'gh', 'api', 'graphql', '-f', 'query=' .. query }
+  for k, v in vim.spairs(vars or {}) do
+    vim.list_extend(cmd, { '-f', ('%s=%s'):format(k, v) })
+  end
+  local out = run_die(
+    cmd,
+    'gh api graphql failed (missing scope? try `gh auth refresh -h github.com -s user`)'
+  )
+  -- luanil drops JSON nulls, for example an empty repo description.
+  return vim.json.decode(out, { luanil = { object = true } }).data
+end
+
+local page_info = 'pageInfo { hasNextPage endCursor }'
+
+--- Follows a GraphQL connection to the end.
+--- @param first table connection that was already fetched
+--- @param next_page fun(cursor: string): table fetches the connection after `cursor`
+--- @return table[]
+local function paginate(first, next_page)
+  local nodes, conn = {}, first
+  while true do
+    vim.list_extend(nodes, conn.nodes)
+    if not conn.pageInfo.hasNextPage then
+      return nodes
+    end
+    conn = next_page(conn.pageInfo.endCursor)
   end
 end
 
-local repo_fields = '{ id nameWithOwner url description }'
+--- @class stars.Repo
+--- @field id string
+--- @field nameWithOwner string
+--- @field url string
+--- @field description? string
 
-local lists_query = string.format(
-  [[
-        lists(first: 50) {
-          nodes { id name items(first: 100) { nodes { ... on Repository %s } } }
-        }]],
-  repo_fields
-)
+--- @class stars.List
+--- @field id string
+--- @field name string
+--- @field repos string[] sorted repo names
 
---- Fetches the lists and every starred repo. The first request carries the
---- list query, so a small account costs one `gh` call instead of two.
---- @return table[] lists
---- @return table[] starred
-local function fetch_remote()
-  local lists ---@type table[]?
-  local starred = {} --- @type table[]
-  local cursor = ''
-  while true do
-    local viewer = gh_graphql(
-      string.format(
-        [[
-      query($cursor: String) {
-        viewer {%s
-          starredRepositories(first: 100, after: $cursor) {
-            pageInfo { hasNextPage endCursor }
-            nodes %s
+--- @class stars.State
+--- @field repos table<string, stars.Repo> starred repos by name
+--- @field lists table<string, stars.List> lists by name
+
+--- Fetches every starred repo and every list from GitHub.
+--- @return stars.State
+local function fetch()
+  local starred_query = ([[
+    query($cursor: String) {
+      viewer {
+        starredRepositories(first: 100, after: $cursor) {
+          %s nodes { id nameWithOwner url description }
+        }
+      }
+    }]]):format(page_info)
+  local lists_query = ([[
+    query($cursor: String) {
+      viewer {
+        lists(first: 100, after: $cursor) {
+          %s nodes {
+            id name
+            items(first: 100) { %s nodes { ... on Repository { nameWithOwner } } }
           }
         }
       }
-      ]],
-        lists and '' or lists_query,
-        repo_fields
-      ),
-      { cursor = cursor }
-    ).viewer
-    lists = lists or viewer.lists.nodes
-    local page = viewer.starredRepositories
-    vim.list_extend(starred, page.nodes)
-    if not page.pageInfo.hasNextPage then
-      return lists, starred
-    end
-    cursor = page.pageInfo.endCursor
-  end
-end
+    }]]):format(page_info, page_info)
+  local items_query = ([[
+    query($id: ID!, $cursor: String) {
+      node(id: $id) {
+        ... on UserList {
+          items(first: 100, after: $cursor) { %s nodes { ... on Repository { nameWithOwner } } }
+        }
+      }
+    }]]):format(page_info)
 
---- Reads the remote state through `stdpath('cache')/stars-state.json`.
---- `fresh` skips the cache and refills it, for `pull` and for `sync --apply`.
---- @param fresh boolean
---- @return table[] lists
---- @return table[] starred
-local function fetch_state(fresh)
-  if fresh then
-    os.remove(nv.cache_path(state_name))
-  end
-  local state = nv.cached(state_name, function()
-    local lists, starred = fetch_remote()
-    return { lists = lists, starred = starred }
+  local starred = paginate(graphql(starred_query).viewer.starredRepositories, function(cursor)
+    return graphql(starred_query, { cursor = cursor }).viewer.starredRepositories
   end)
-  return state.lists, state.starred
-end
+  local lists = paginate(graphql(lists_query).viewer.lists, function(cursor)
+    return graphql(lists_query, { cursor = cursor }).viewer.lists
+  end)
 
---- @param lists table[]
---- @param uncategorized_repos string[]
-local function write_json(lists, uncategorized_repos)
-  local out = { [uncategorized] = uncategorized_repos } --- @type table<string, string[]>
-  for _, l in ipairs(lists) do
-    out[l.name] = vim.iter(l.items.nodes):map(function(n)
-      return n.nameWithOwner
-    end):totable()
+  local state = { repos = {}, lists = {} } --- @type stars.State
+  for _, repo in ipairs(starred) do
+    state.repos[repo.nameWithOwner] = repo
   end
-  for _, repos in pairs(out) do
+  for _, list in ipairs(lists) do
+    local items = paginate(list.items, function(cursor)
+      return graphql(items_query, { id = list.id, cursor = cursor }).node.items
+    end)
+    local repos = vim
+      .iter(items)
+      :map(function(item)
+        return item.nameWithOwner -- nil for anything that is not a repository
+      end)
+      :totable()
     table.sort(repos)
+    state.lists[list.name] = { id = list.id, name = list.name, repos = repos }
   end
-  nv.json.write(json_path, out)
+  return state
 end
 
---- @param lines string[]
---- @param nodes table[]
---- @param name string
-local function readme_section(lines, nodes, name)
-  table.sort(nodes, function(a, b)
-    return a.nameWithOwner < b.nameWithOwner
-  end)
-  lines[#lines + 1] = string.format('### %s (%d)', name, #nodes)
-  lines[#lines + 1] = ''
-  for _, n in ipairs(nodes) do
-    local desc = n.description and (' — ' .. n.description) or ''
-    lines[#lines + 1] = string.format('- [%s](%s)%s', n.nameWithOwner, n.url, desc)
-  end
-end
-
---- @param lists table[]
---- @param uncategorized_nodes table[]
-local function write_readme_stars(lists, uncategorized_nodes)
-  local lines = {}
-  for _, l in ipairs(lists) do
-    readme_section(lines, l.items.nodes, l.name)
-    lines[#lines + 1] = ''
-  end
-  readme_section(lines, uncategorized_nodes, uncategorized)
-
-  local readme = read_file(readme_path)
-  local start_marker = readme:find(stars_start, 1, true)
-  local end_marker = readme:find(stars_end, 1, true)
-  if not start_marker or not end_marker or end_marker < start_marker then
-    die(string.format('%s/%s markers not found or out of order in README.md', stars_start, stars_end))
-  end
-  local head = readme:sub(1, start_marker + #stars_start - 1)
-  write_file(readme_path, head .. '\n' .. table.concat(lines, '\n') .. '\n' .. readme:sub(end_marker))
-end
-
-local function cmd_pull()
-  local lists, starred = fetch_state(true)
-
-  local categorized = vim.iter(lists):fold({}, function(acc, l)
-    for _, n in ipairs(l.items.nodes) do
-      acc[n.nameWithOwner] = true
-    end
-    return acc
-  end)
-
-  local rest = vim.iter(starred):filter(function(n)
-    return not categorized[n.nameWithOwner]
-  end):totable()
-  local rest_names = vim.iter(rest):map(function(n)
-    return n.nameWithOwner
-  end):totable()
-
-  write_json(lists, rest_names)
-  write_readme_stars(lists, rest)
-  print(
-    paint('wrote ' .. json_path .. ' and updated README.md', color.green)
-      .. string.format(' (%d starred, %d lists)', #starred, #lists)
-  )
-end
-
---- @return table<string, true> repos
---- @return table<string, table<string, true>> membership
---- @return table<string, true> lists
-local function load_desired()
-  local data = nv.json.read(json_path)
-  if not data then
-    die(string.format('%s not found or invalid -- run `./stars.lua pull` first', json_path))
-  end
-  local repos = {} --- @type table<string, true>
-  local membership = vim.defaulttable() --- @type table<string, table<string, true>>
-  local lists = {} --- @type table<string, true>
-  for name, list_repos in pairs(data) do
-    for _, r in ipairs(list_repos) do
-      repos[r] = true
-      if name ~= uncategorized then
-        membership[r][name] = true
-      end
-    end
-    if name ~= uncategorized then
-      lists[name] = true
-    end
-  end
-  return repos, membership, lists
-end
-
---- Keys of `a` that `b` does not have, sorted.
---- @param a table<string, any>
---- @param b table<string, any>
+--- Repo names that are not in any list.
+--- @param state stars.State
 --- @return string[]
-local function difference(a, b)
-  local out = vim.iter(a):map(function(k)
-    return b[k] == nil and k or nil
-  end):totable()
+local function uncategorized_repos(state)
+  local listed = {} --- @type table<string, true>
+  for _, list in pairs(state.lists) do
+    for _, r in ipairs(list.repos) do
+      listed[r] = true
+    end
+  end
+  local out = vim.tbl_filter(function(r)
+    return not listed[r]
+  end, vim.tbl_keys(state.repos))
   table.sort(out)
   return out
 end
 
-local cmd_sync ---@type fun(apply: boolean)
+--- @param state stars.State
+local function render_readme(state)
+  local lines = {} --- @type string[]
 
---- @return boolean
-local function confirm()
-  if vim.uv.guess_handle(0) ~= 'tty' then
-    print(paint('\ndry run -- no changes made. re-run with --apply to push.', color.yellow))
-    return false
+  local function section(title, repos)
+    lines[#lines + 1] = ('### %s (%d)'):format(title, #repos)
+    lines[#lines + 1] = ''
+    for _, name in ipairs(repos) do
+      local repo = state.repos[name] or { url = 'https://github.com/' .. name }
+      local desc = repo.description and (' — ' .. vim.trim(repo.description)) or ''
+      lines[#lines + 1] = ('- [%s](%s)%s'):format(name, repo.url, desc)
+    end
+    lines[#lines + 1] = ''
   end
-  io.write(paint('\napply these changes? [y/N] ', color.yellow))
-  local answer = (io.read('l') or ''):lower()
-  if answer ~= 'y' and answer ~= 'yes' then
-    print(paint('aborted -- no changes made.', color.yellow))
-    return false
+
+  for name, list in vim.spairs(state.lists) do
+    section(name, list.repos)
   end
-  return true
+  section(uncategorized, uncategorized_repos(state))
+
+  local readme = read_file(readme_file) or die('cannot read ' .. readme_file)
+  local i = readme:find(stars_start, 1, true)
+  local j = readme:find(stars_end, 1, true)
+  if not i or not j or j < i then
+    die(('%s/%s markers not found or out of order in %s'):format(stars_start, stars_end, readme_file))
+  end
+  write_file(
+    readme_file,
+    readme:sub(1, i + #stars_start - 1) .. '\n' .. table.concat(lines, '\n') .. readme:sub(j)
+  )
+end
+
+local function pull()
+  local state = fetch()
+  local out = { [uncategorized] = uncategorized_repos(state) } --- @type table<string, string[]>
+  for name, list in pairs(state.lists) do
+    out[name] = list.repos
+  end
+  write_json(stars_file, out)
+  render_readme(state)
+  print(
+    ('wrote %s and README.md (%d starred, %d lists)'):format(
+      vim.fs.basename(stars_file),
+      vim.tbl_count(state.repos),
+      vim.tbl_count(state.lists)
+    )
+  )
+end
+
+--- Reads stars.json into the shape `sync` diffs against.
+--- @return table<string, table<string, true>> membership repo -> set of list names
+--- @return table<string, true> lists set of list names
+local function read_wanted()
+  local text = read_file(stars_file) or die(stars_file .. ' not found -- run `./stars.lua pull` first')
+  local ok, data = pcall(vim.json.decode, text)
+  if not ok or type(data) ~= 'table' then
+    die(('%s is not valid JSON: %s'):format(stars_file, data))
+  end
+  local membership, lists = {}, {}
+  for name, repos in pairs(data) do
+    if name ~= uncategorized then
+      lists[name] = true
+    end
+    for _, r in ipairs(repos) do
+      membership[r] = membership[r] or {}
+      if name ~= uncategorized then
+        membership[r][name] = true
+      end
+    end
+  end
+  return membership, lists
+end
+
+--- Keys of `a` that are not in `b`, sorted.
+--- @param a table
+--- @param b table
+--- @return string[]
+local function missing(a, b)
+  local out = vim.tbl_filter(function(k)
+    return b[k] == nil
+  end, vim.tbl_keys(a))
+  table.sort(out)
+  return out
+end
+
+--- @param set table<string, true>
+--- @return string[]
+local function sorted(set)
+  local out = vim.tbl_keys(set)
+  table.sort(out)
+  return out
 end
 
 --- @param apply boolean
-function cmd_sync(apply)
-  local desired_repos, desired_membership, desired_lists = load_desired()
+local function sync(apply)
+  local want, want_lists = read_wanted()
+  local state = fetch()
 
-  -- `--apply` refetches, so the mutations run against current GitHub state.
-  local lists, starred = fetch_state(apply)
+  local plan = {
+    star = missing(want, state.repos),
+    unstar = missing(state.repos, want),
+    create = missing(want_lists, state.lists),
+    delete = missing(state.lists, want_lists),
+    reassign = {}, --- @type string[]
+  }
 
-  local id_map = vim.iter(starred):fold({}, function(acc, n)
-    acc[n.nameWithOwner] = n.id
-    return acc
-  end)
-  local current_repos = vim.iter(starred):fold({}, function(acc, n)
-    acc[n.nameWithOwner] = true
-    return acc
-  end)
-
-  local current_lists = {} --- @type table<string, table>
-  local current_membership = vim.defaulttable() --- @type table<string, table<string, true>>
-  for _, l in ipairs(lists) do
-    current_lists[l.name] = l
-    for _, n in ipairs(l.items.nodes) do
-      current_membership[n.nameWithOwner][l.name] = true
+  -- Current membership, ignoring lists that are about to be deleted.
+  local have = {} --- @type table<string, table<string, true>>
+  for name, list in pairs(state.lists) do
+    if want_lists[name] then
+      for _, r in ipairs(list.repos) do
+        have[r] = have[r] or {}
+        have[r][name] = true
+      end
+    end
+  end
+  -- Includes repos that are about to be starred, so they land in their lists
+  -- in the same run.
+  for _, r in ipairs(sorted(want)) do
+    if not vim.deep_equal(want[r], have[r] or {}) then
+      plan.reassign[#plan.reassign + 1] = r
     end
   end
 
-  local to_star = difference(desired_repos, current_repos)
-  local to_unstar = difference(current_repos, desired_repos)
-  local to_create = difference(desired_lists, current_lists)
-  local to_delete = difference(current_lists, desired_lists)
-
-  local function count(label, items, c)
-    print(paint(string.format('%s %d', label, #items), #items > 0 and c or color.dim))
+  for _, r in ipairs(plan.star) do
+    print('+ star     ' .. r)
   end
-  count('star:       ', to_star, color.green)
-  count('unstar:     ', to_unstar, color.red)
-  count('create list:', to_create, color.green)
-  count('delete list:', to_delete, color.red)
-
-  for _, r in ipairs(to_star) do
-    print(paint('  + star   ' .. r, color.green))
+  for _, r in ipairs(plan.unstar) do
+    print('- unstar   ' .. r)
   end
-  for _, r in ipairs(to_unstar) do
-    print(paint('  - unstar ' .. r, color.red))
+  for _, name in ipairs(plan.create) do
+    print(('+ list     "%s"'):format(name))
   end
-  for _, name in ipairs(to_create) do
-    print(paint(string.format('  + list   "%s"', name), color.green))
+  for _, name in ipairs(plan.delete) do
+    print(('- list     "%s"'):format(name))
   end
-  for _, name in ipairs(to_delete) do
-    print(paint(string.format('  - list   "%s"', name), color.red))
+  for _, r in ipairs(plan.reassign) do
+    print(('~ %s -> [%s]'):format(r, table.concat(sorted(want[r]), ', ')))
   end
 
-  local moved = vim.iter(desired_repos):map(function(r)
-    local changed = not vim.deep_equal(desired_membership[r], current_membership[r])
-    return (current_repos[r] and changed) and r or nil
-  end):totable()
-  table.sort(moved)
-
-  count('reassign membership:', moved, color.cyan)
-  for _, r in ipairs(moved) do
-    local want = sorted_keys(desired_membership[r])
-    print(paint(string.format('  ~ %s -> %s', r, vim.inspect(want)), color.cyan))
+  local total = #plan.star + #plan.unstar + #plan.create + #plan.delete + #plan.reassign
+  if total == 0 then
+    print('already in sync')
+    return
   end
-
-  if #to_star + #to_unstar + #to_create + #to_delete + #moved == 0 then
-    print(paint('\nalready in sync -- nothing to do.', color.green))
+  print(
+    ('\n%d star, %d unstar, %d create, %d delete, %d reassign'):format(
+      #plan.star,
+      #plan.unstar,
+      #plan.create,
+      #plan.delete,
+      #plan.reassign
+    )
+  )
+  if not apply then
+    print('dry run -- re-run with --apply to push these changes')
     return
   end
 
-  if not apply then
-    if not confirm() then
-      return
+  -- Resolve every repo id before changing anything, so a typo in stars.json
+  -- fails here instead of halfway through.
+  local ids = {} --- @type table<string, string>
+  for name, repo in pairs(state.repos) do
+    ids[name] = repo.id
+  end
+  for _, r in ipairs(plan.star) do
+    local owner, name = r:match('^([^/]+)/([^/]+)$')
+    if not owner then
+      die(('invalid repo name "%s" in %s'):format(r, stars_file))
     end
-    -- The diff above can come from the cache. Refetch, then apply without
-    -- asking a second time.
-    return cmd_sync(true)
-  end
-
-  for _, r in ipairs(to_unstar) do
-    gh_rest('DELETE', '/user/starred/' .. r)
-    print(paint('unstarred ' .. r, color.red))
-  end
-
-  for _, r in ipairs(to_star) do
-    local owner, name = r:match('^([^/]+)/(.+)$')
-    gh_rest('PUT', '/user/starred/' .. r)
-    local node = gh_graphql(
-      'query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ id } }',
+    local repo = graphql(
+      'query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }',
       { owner = owner, name = name }
-    )
-    id_map[r] = node.repository.id
-    print(paint('starred ' .. r, color.green))
+    ).repository
+    ids[r] = repo and repo.id or die(('repo "%s" not found'):format(r))
   end
 
-  local list_id_map = vim.iter(current_lists):fold({}, function(acc, name, l)
-    acc[name] = l.id
-    return acc
-  end)
+  -- Snapshot GitHub as it stood right before the changes, so a bad apply can
+  -- be inspected or reverted by hand.
+  vim.fn.mkdir(vim.fs.dirname(backup_file), 'p')
+  write_json(backup_file, state)
+  print('backed up current state to ' .. backup_file)
 
-  for _, name in ipairs(to_create) do
-    local data = gh_graphql(
-      'mutation($name:String!){ createUserList(input:{name:$name}) { list { id name } } }',
+  for _, r in ipairs(plan.unstar) do
+    graphql(
+      'mutation($id: ID!) { removeStar(input: { starrableId: $id }) { clientMutationId } }',
+      { id = ids[r] }
+    )
+    print('unstarred ' .. r)
+  end
+  for _, r in ipairs(plan.star) do
+    graphql(
+      'mutation($id: ID!) { addStar(input: { starrableId: $id }) { clientMutationId } }',
+      { id = ids[r] }
+    )
+    print('starred ' .. r)
+  end
+
+  local list_ids = {} --- @type table<string, string>
+  for name, list in pairs(state.lists) do
+    list_ids[name] = list.id
+  end
+  for _, name in ipairs(plan.create) do
+    list_ids[name] = graphql(
+      'mutation($name: String!) { createUserList(input: { name: $name }) { list { id } } }',
       { name = name }
+    ).createUserList.list.id
+    print(('created list "%s"'):format(name))
+  end
+  for _, name in ipairs(plan.delete) do
+    graphql(
+      'mutation($id: ID!) { deleteUserList(input: { listId: $id }) { clientMutationId } }',
+      { id = list_ids[name] }
     )
-    list_id_map[name] = data.createUserList.list.id
-    print(paint(string.format('created list "%s"', name), color.green))
+    print(('deleted list "%s"'):format(name))
   end
 
-  for _, name in ipairs(to_delete) do
-    gh_graphql(
-      'mutation($id:ID!){ deleteUserList(input:{listId:$id}) { clientMutationId } }',
-      { id = current_lists[name].id }
-    )
-    print(paint(string.format('deleted list "%s"', name), color.red))
-  end
-
-  for _, r in ipairs(moved) do
-    local want = sorted_keys(desired_membership[r])
-    local list_ids = vim.json.encode(vim.iter(want):map(function(n)
-      return list_id_map[n]
-    end):totable())
-    gh_graphql(
-      string.format(
-        'mutation($itemId:ID!){ updateUserListsForItem(input:{itemId:$itemId, listIds:%s}) { clientMutationId } }',
-        list_ids
+  for _, r in ipairs(plan.reassign) do
+    local names = sorted(want[r])
+    -- An array cannot be sent with `-f`, so the ids go into the query itself.
+    local list_json = vim.json.encode(vim.tbl_map(function(n)
+      return list_ids[n]
+    end, names))
+    graphql(
+      ('mutation($id: ID!) { updateUserListsForItem(input: { itemId: $id, listIds: %s }) { clientMutationId } }'):format(
+        list_json
       ),
-      { itemId = id_map[r] }
+      { id = ids[r] }
     )
-    print(paint(string.format('reassigned %s -> %s', r, vim.inspect(want)), color.cyan))
+    print(('%s -> [%s]'):format(r, table.concat(names, ', ')))
   end
 
-  -- GitHub changed, so the cached snapshot is wrong now.
-  os.remove(nv.cache_path(state_name))
-  print(paint('\napplied.', color.green) .. ' run `./stars.lua pull` to refresh local files.')
+  print('\ndone -- run `./stars.lua pull` to refresh stars.json and README.md')
 end
 
 local function usage()
-  print(string.format(
-    [[
-Usage: ./stars.lua <command>
+  local this_script = './' .. vim.fs.basename(_G.arg[0])
+  print(([=[
+    Sync GitHub stars and star lists with stars.json
 
-  pull            fetch GitHub state into stars.json + README.md
-  sync            diff stars.json against GitHub (dry run by default)
-  sync --apply    push changes for real
+    Usage:  %s <command> [options]
+        %s pull            fetch GitHub into stars.json and README.md
+        %s sync            show what syncing stars.json would change on GitHub
+        %s sync --apply    push those changes to GitHub
 
-stars.json:  %s
-cached state: %s (pull and `sync --apply` refresh it)]],
-    json_path,
-    nv.cache_path(state_name)
-  ))
+    Options:
+        -h, --help            show this message and exit.
+        --apply               (sync) make the changes instead of a dry run.
+
+    stars.json maps each list name to the repos in it ("owner/name"). Repos in
+    no list go under "%s". A repo may be in several lists.
+  ]=]):format(this_script, this_script, this_script, this_script, uncategorized))
 end
 
 do
-  local command = _G.arg[1]
-  local apply = false
-  for i = 2, #_G.arg do
-    if _G.arg[i] == '--apply' then
-      apply = true
+  local args = {}
+  for _, a in ipairs(_G.arg) do
+    if a == '-h' or a == '--help' then
+      args.h = true
+    elseif a == '--apply' then
+      args.apply = true
+    elseif vim.startswith(a, '-') then
+      die(('Invalid argument %s\n'):format(a))
+    elseif not args.command then
+      args.command = a
     else
-      die('invalid argument ' .. _G.arg[i])
+      die(('Unexpected argument %s\n'):format(a))
     end
   end
 
-  if command == 'pull' then
-    cmd_pull()
-
-  elseif command == 'sync' then
-    cmd_sync(apply)
-  elseif command == '-h' or command == '--help' then
+  if args.h or not args.command then
     usage()
+  elseif args.command == 'pull' then
+    pull()
+  elseif args.command == 'sync' then
+    sync(args.apply == true)
   else
     usage()
-    die('\nmissing or invalid command')
+    die(('Unknown command %s\n'):format(args.command))
   end
 end

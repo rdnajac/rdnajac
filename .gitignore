@@ -1,3 +1,5 @@
 # ignore everything...
 *
-!stars.json
+!/.github/
+!/.github/workflows/
+!/.github/workflows/stars.yml

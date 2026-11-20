@@ -1,0 +1,72 @@
+name: stars
+
+# Rebuild the Stars section of README.md from the GitHub API on every push.
+# The job writes only the text between the "generated" comment and the next
+# horizontal rule, so edits outside that span are safe. Its own commit carries
+# [skip ci], so it never loops.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render README from starred repos and lists
+        # STARS_TOKEN is a Personal Access Token with the `read:user` scope.
+        # The built-in GITHUB_TOKEN acts as the github-actions bot, whose star
+        # lists are empty, so a user token is required to read the categories.
+        env:
+          GH_TOKEN: ${{ secrets.STARS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # One paginated query returns every starred repo (with description)
+          # and the star lists. jq -s slurps the pages, then builds the section:
+          # a "### list (n)" block per list in codepoint order, then an
+          # Uncategorized block for stars in no list. Each list reads <=100 repos.
+          body=$(gh api graphql --paginate \
+            -f query='query($endCursor:String){viewer{starredRepositories(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{nameWithOwner description}} lists(first:100){nodes{name items(first:100){nodes{... on Repository{nameWithOwner}}}}}}}' \
+            --jq '.data.viewer' | jq -rs '
+              [.[].starredRepositories.nodes[]] as $starred
+              | .[0].lists.nodes as $lists
+              | ($starred | map({(.nameWithOwner): (.description // "" | gsub("^\\s+|\\s+$";""))}) | add) as $desc
+              | ($lists | map({name, repos: (.items.nodes | map(.nameWithOwner) | map(select(.!=null)) | unique)})) as $L
+              | (($L | map(.repos) | add) // [] | unique) as $listed
+              | ($starred | map(.nameWithOwner) | map(select(IN($listed[]) | not)) | sort) as $uncat
+              | def line($n): ($desc[$n] // "") as $d
+                  | if ($d|length)>0 then "- [\($n)](https://github.com/\($n)) — \($d)"
+                    else "- [\($n)](https://github.com/\($n))" end;
+                def sec($t;$r): ["### \($t) (\($r|length))",""] + ($r|sort|map(line(.))) + [""];
+                (($L | sort_by(.name) | map(sec(.name;.repos)) | add) + sec("Uncategorized"; $uncat))
+              | join("\n")')
+
+          # Splice the body between the "generated" comment and the next ---.
+          anchor='<!-- This section is generated; do not edit. -->'
+          grep -qF "$anchor" README.md && grep -qx -- '---' README.md \
+            || { echo "::error::README.md is missing the generated-section anchors"; exit 1; }
+          tmp=$(mktemp)
+          {
+            sed -n "1,/$anchor/p" README.md
+            printf '\n%s\n\n' "$body"
+            sed -n '/^---$/,$p' README.md
+          } >"$tmp"
+          mv "$tmp" README.md
+
+      - name: Commit if changed
+        run: |
+          if git diff --quiet README.md; then
+            echo "README.md unchanged"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md
+          git commit -m 'docs(stars): render README [skip ci]'
+          git push
